@@ -1,7 +1,6 @@
-import type { ReviewStatus, SignItem, SignProject, TermBinding } from "./types";
-
-export const uid = (prefix: string) =>
-  `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+import type { ReviewStatus, SignItem, SignProject, TermBinding, TermEntry } from "./types";
+import { buildTermReport } from "./terminology";
+import { uid } from "./utils";
 
 export const STATUS_LABELS: Record<ReviewStatus, string> = {
   draft: "草稿",
@@ -10,8 +9,17 @@ export const STATUS_LABELS: Record<ReviewStatus, string> = {
   changes: "需修改",
 };
 
-const term = (source: string, target: string, confirmed = false, required = true): TermBinding => ({
+const entry = (id: string, source: string, targets: Record<string, string>, required = true): TermEntry => ({
+  id,
+  source,
+  targets,
+  required,
+  updatedAt: "2026-09-20T08:00:00.000Z",
+});
+
+const bind = (entryId: string, source: string, target: string, confirmed = false, required = true): TermBinding => ({
   id: uid("term"),
+  termId: entryId,
   source,
   target,
   required,
@@ -19,6 +27,18 @@ const term = (source: string, target: string, confirmed = false, required = true
 });
 
 export const createSeedProject = (): SignProject => {
+  const termEntries: TermEntry[] = [
+    entry("te-waiting-area", "候车区", { English: "Waiting Area" }),
+    entry("te-yellow-line", "黄线", { English: "yellow line" }),
+    entry("te-emergency-exit", "紧急出口", { English: "EMERGENCY EXIT" }),
+    entry("te-elevator", "电梯", { English: "elevator" }),
+    entry("te-drinking-water", "直饮水", { "日本語": "飲料水" }),
+    entry("te-sink", "水槽", { "日本語": "排水口" }),
+    entry("te-no-smoking", "禁止吸烟", { "Français": "INTERDICTION DE FUMER" }),
+    entry("te-e-cigarette", "电子烟", { "Français": "Cigarettes électroniques" }),
+    entry("te-accessible-elevator", "无障碍电梯", { English: "accessible elevator" }),
+  ];
+
   const signs: SignItem[] = [
     {
       id: "sign-platform",
@@ -29,7 +49,7 @@ export const createSeedProject = (): SignProject => {
       scenario: "轨道交通站台",
       regulation: "GB/T 10001.1-2023 公共信息图形符号",
       status: "pending",
-      terms: [term("候车区", "Waiting Area"), term("黄线", "yellow line")],
+      terms: [bind("te-waiting-area", "候车区", "Waiting Area"), bind("te-yellow-line", "黄线", "yellow line")],
       comments: [],
       versions: [],
       emergencyRevision: false,
@@ -44,7 +64,7 @@ export const createSeedProject = (): SignProject => {
       scenario: "商场疏散通道",
       regulation: "GB 13495.1-2015 消防安全标志",
       status: "confirmed",
-      terms: [term("紧急出口", "EMERGENCY EXIT", true), term("电梯", "elevator", true)],
+      terms: [bind("te-emergency-exit", "紧急出口", "EMERGENCY EXIT", true), bind("te-elevator", "电梯", "elevator", true)],
       comments: [],
       versions: [],
       emergencyRevision: false,
@@ -59,7 +79,7 @@ export const createSeedProject = (): SignProject => {
       scenario: "公园服务亭",
       regulation: "城市公共设施双语标识译写规范",
       status: "changes",
-      terms: [term("直饮水", "飲料水"), term("水槽", "排水口")],
+      terms: [bind("te-drinking-water", "直饮水", "飲料水"), bind("te-sink", "水槽", "排水口")],
       comments: [],
       versions: [],
       emergencyRevision: false,
@@ -74,20 +94,43 @@ export const createSeedProject = (): SignProject => {
       scenario: "医院入口",
       regulation: "公共场所卫生管理条例实施细则",
       status: "draft",
-      terms: [term("禁止吸烟", "INTERDICTION DE FUMER"), term("电子烟", "Cigarettes électroniques")],
+      terms: [bind("te-no-smoking", "禁止吸烟", "INTERDICTION DE FUMER"), bind("te-e-cigarette", "电子烟", "Cigarettes électroniques")],
       comments: [],
       versions: [],
       emergencyRevision: false,
       updatedAt: "2026-09-24T04:15:00.000Z",
     },
+    {
+      id: "sign-elevator",
+      code: "PR-11",
+      sourceText: "无障碍电梯。行动不便者可乘电梯直达站厅。",
+      targetLanguage: "English",
+      targetText: "Accessible Elevator\nPassengers with limited mobility may take the lift directly to the concourse.",
+      scenario: "交通枢纽换乘大厅",
+      regulation: "GB 50763-2012 无障碍设计规范",
+      status: "pending",
+      terms: [
+        bind("te-accessible-elevator", "无障碍电梯", "accessible elevator"),
+        // 绑定时的旧译法，与术语库中“电梯”的固定译法 elevator 不一致，用于演示核对报告。
+        bind("te-elevator", "电梯", "lift", true),
+      ],
+      comments: [],
+      versions: [],
+      emergencyRevision: false,
+      updatedAt: "2026-09-24T10:30:00.000Z",
+    },
   ];
 
-  return {
+  const project: SignProject = {
     id: "public-sign-review-1008",
     title: "城市公共标识多语言校对",
     location: "滨海交通枢纽一期",
     activeSignId: signs[0].id,
     signs,
+    termEntries,
+    termReport: { checkedAt: new Date().toISOString(), mismatchIssues: [], missingIssues: [] },
     updatedAt: new Date().toISOString(),
   };
+  project.termReport = buildTermReport(project);
+  return project;
 };

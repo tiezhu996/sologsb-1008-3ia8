@@ -1,8 +1,17 @@
 import { $, component$, useSignal, useVisibleTask$, type QRL } from "@builder.io/qwik";
 import { type DocumentHead } from "@builder.io/qwik-city";
-import { createSeedProject, STATUS_LABELS, uid } from "../data";
+import { createSeedProject, STATUS_LABELS } from "../data";
+import {
+  TARGET_LANGUAGES,
+  buildTermReport,
+  effectiveTermTarget,
+  findTermEntry,
+  isBindingStale,
+  issueMapBySign,
+  migrateProject,
+} from "../terminology";
 import type { ReviewStatus, SignItem, SignProject } from "../types";
-import { analyzeSign, cloneTerms, diffText } from "../utils";
+import { analyzeSign, cloneTerms, diffText, uid } from "../utils";
 
 const STORAGE_KEY = "sologsb-1008-project-v1";
 const WIDTHS = [320, 480, 720, 960] as const;
@@ -10,7 +19,7 @@ const WIDTHS = [320, 480, 720, 960] as const;
 export const head: DocumentHead = {
   title: "公共标识多语言校对台",
   meta: [
-    { name: "description", content: "公共标识译文、术语、版本和版面风险校对工作台" },
+    { name: "description", content: "公共标识译文、术语库、版本和版面风险校对工作台" },
   ],
 };
 
@@ -32,6 +41,13 @@ export default component$(() => {
   const selectedVersionId = useSignal("");
   const termSource = useSignal("");
   const termTarget = useSignal("");
+  const bindTermId = useSignal("");
+  const glossaryOpen = useSignal(false);
+  const glossaryTab = useSignal<"report" | "entries">("report");
+  const newTermSource = useSignal("");
+  const newTermLang = useSignal(TARGET_LANGUAGES[0]);
+  const newTermTarget = useSignal("");
+  const newTermRequired = useSignal(true);
   const commentDraft = useSignal("");
   const replyDraft = useSignal("");
   const replyingTo = useSignal("");
@@ -46,6 +62,7 @@ export default component$(() => {
     const draft = structuredClone(project.value);
     update(draft);
     draft.updatedAt = new Date().toISOString();
+    draft.termReport = buildTermReport(draft);
     project.value = draft;
   });
 
@@ -80,6 +97,12 @@ export default component$(() => {
     const index = Math.max(0, signs.findIndex((sign) => sign.id === project.value.activeSignId));
     const next = signs[(index + direction + signs.length) % signs.length];
     commit("切换标识", (draft) => { draft.activeSignId = next.id; });
+    selectedVersionId.value = "";
+  });
+
+  const jumpToSign = $((signId: string) => {
+    commit("定位标识", (draft) => { draft.activeSignId = signId; });
+    glossaryOpen.value = false;
     selectedVersionId.value = "";
   });
 
@@ -126,16 +149,170 @@ export default component$(() => {
     toast.value = "版本快照已保存";
   });
 
+  const bindEntryToSign = $((entryId: string) => {
+    const entry = project.value.termEntries.find((item) => item.id === entryId);
+    if (!entry) return;
+    updateActive("绑定术语库术语", (sign) => {
+      if (sign.terms.some((term) => term.termId === entry.id)) return;
+      sign.terms.push({
+        id: uid("term"),
+        termId: entry.id,
+        source: entry.source,
+        target: effectiveTermTarget(entry, sign.targetLanguage),
+        required: entry.required,
+        confirmed: false,
+      });
+      sign.status = "pending";
+    });
+  });
+
+  const bindLibraryTerm = $(() => {
+    if (!bindTermId.value) return;
+    const entry = project.value.termEntries.find((item) => item.id === bindTermId.value);
+    bindTermId.value = "";
+    if (!entry) return;
+    bindEntryToSign(entry.id);
+    toast.value = `已绑定术语「${entry.source}」`;
+  });
+
   const addTerm = $(() => {
     const source = termSource.value.trim();
     const target = termTarget.value.trim();
     if (!source || !target) return;
-    updateActive("绑定术语", (sign) => {
-      sign.terms.push({ id: uid("term"), source, target, required: true, confirmed: false });
-      sign.status = "pending";
-    });
+    const existing = findTermEntry(project.value, source);
+    if (existing) {
+      bindEntryToSign(existing.id);
+      toast.value = `「${existing.source}」已在术语库中，已直接绑定`;
+    } else {
+      const language = project.value.signs.find((sign) => sign.id === project.value.activeSignId)?.targetLanguage ?? TARGET_LANGUAGES[0];
+      const entryId = uid("termentry");
+      commit("登记术语并绑定", (draft) => {
+        draft.termEntries.push({
+          id: entryId,
+          source,
+          targets: { [language]: target },
+          required: true,
+          updatedAt: new Date().toISOString(),
+        });
+        const sign = draft.signs.find((item) => item.id === draft.activeSignId);
+        if (sign && !sign.terms.some((term) => term.termId === entryId)) {
+          sign.terms.push({ id: uid("term"), termId: entryId, source, target, required: true, confirmed: false });
+          sign.status = "pending";
+        }
+      });
+      toast.value = `已登记术语「${source}」并绑定到当前标识`;
+    }
     termSource.value = "";
     termTarget.value = "";
+  });
+
+  const addGlossaryEntry = $(() => {
+    const source = newTermSource.value.trim();
+    const target = newTermTarget.value.trim();
+    const language = newTermLang.value;
+    if (!source || !target) return;
+    if (findTermEntry(project.value, source)) {
+      toast.value = `术语库中已存在「${source}」，请直接编辑其固定译法`;
+      return;
+    }
+    commit("术语库登记术语", (draft) => {
+      draft.termEntries.push({
+        id: uid("termentry"),
+        source,
+        targets: { [language]: target },
+        required: newTermRequired.value,
+        updatedAt: new Date().toISOString(),
+      });
+    });
+    newTermSource.value = "";
+    newTermTarget.value = "";
+    toast.value = `术语「${source}」已登记到术语库`;
+  });
+
+  const updateFixedTarget = $((entryId: string, language: string, rawValue: string) => {
+    const entry = project.value.termEntries.find((item) => item.id === entryId);
+    if (!entry) return;
+    const value = rawValue.trim();
+    const before = (entry.targets[language] ?? "").trim();
+    if (before === value) return;
+    // 固定译法一经调整，所有引用该术语的标识一律退回待确认。
+    const affected = project.value.signs.filter((sign) => sign.terms.some((term) => term.termId === entryId)).length;
+    commit("调整固定译法", (draft) => {
+      const current = draft.termEntries.find((item) => item.id === entryId);
+      if (!current) return;
+      if (value) current.targets[language] = value;
+      else delete current.targets[language];
+      current.updatedAt = new Date().toISOString();
+      for (const sign of draft.signs) {
+        if (sign.terms.some((term) => term.termId === entryId)) sign.status = "pending";
+      }
+    });
+    toast.value = affected
+      ? `固定译法已更新，${affected} 处引用标识已退回待确认`
+      : "固定译法已更新";
+  });
+
+  const renameEntry = $((entryId: string, rawValue: string) => {
+    const value = rawValue.trim();
+    const entry = project.value.termEntries.find((item) => item.id === entryId);
+    if (!entry || !value || entry.source === value) return;
+    commit("重命名术语", (draft) => {
+      const current = draft.termEntries.find((item) => item.id === entryId);
+      if (!current) return;
+      current.source = value;
+      current.updatedAt = new Date().toISOString();
+      for (const sign of draft.signs) {
+        for (const term of sign.terms) {
+          if (term.termId === entryId) term.source = value;
+        }
+      }
+    });
+  });
+
+  const toggleEntryRequired = $((entryId: string) => {
+    commit("切换术语必选", (draft) => {
+      const entry = draft.termEntries.find((item) => item.id === entryId);
+      if (!entry) return;
+      entry.required = !entry.required;
+      entry.updatedAt = new Date().toISOString();
+      for (const sign of draft.signs) {
+        for (const term of sign.terms) {
+          if (term.termId === entryId) term.required = entry.required;
+        }
+      }
+    });
+  });
+
+  const deleteEntry = $((entryId: string) => {
+    const entry = project.value.termEntries.find((item) => item.id === entryId);
+    if (!entry) return;
+    const usages = project.value.signs.filter((sign) => sign.terms.some((term) => term.termId === entryId)).length;
+    const message = usages
+      ? `删除术语「${entry.source}」？${usages} 处标识的绑定会一并移除。`
+      : `删除术语「${entry.source}」？`;
+    if (!window.confirm(message)) return;
+    commit("删除术语库条目", (draft) => {
+      draft.termEntries = draft.termEntries.filter((item) => item.id !== entryId);
+      for (const sign of draft.signs) {
+        sign.terms = sign.terms.filter((term) => term.termId !== entryId);
+      }
+    });
+    toast.value = `术语「${entry.source}」已删除`;
+  });
+
+  const syncBinding = $((signId: string, bindingId: string) => {
+    commit("同步固定译法", (draft) => {
+      const sign = draft.signs.find((item) => item.id === signId);
+      const binding = sign?.terms.find((item) => item.id === bindingId);
+      if (!sign || !binding) return;
+      const entry = draft.termEntries.find((item) => item.id === binding.termId);
+      const fixed = entry?.targets[sign.targetLanguage]?.trim();
+      if (!fixed) return;
+      binding.target = fixed;
+      binding.confirmed = false;
+      sign.status = "pending";
+    });
+    toast.value = "已按术语库固定译法同步，标识退回待确认";
   });
 
   const addComment = $(() => {
@@ -174,19 +351,42 @@ export default component$(() => {
     toast.value = "只读预览链接已复制";
   });
 
-  const preview = () => analyzeSign(active(), previewWidth.value, previewFont.value);
+  const preview = () => analyzeSign(active(), previewWidth.value, previewFont.value, project.value.termEntries);
   const selectedVersion = () => active().versions.find((version) => version.id === selectedVersionId.value) ?? active().versions[0];
   const comparison = () => {
     const version = selectedVersion();
     return version ? diffText(version.targetText, active().targetText) : [];
   };
+  const entryFor = (termId: string) => project.value.termEntries.find((entry) => entry.id === termId);
+  const availableEntries = () => {
+    const sign = active();
+    return project.value.termEntries.filter((entry) => !sign.terms.some((term) => term.termId === entry.id));
+  };
+  const entryUsages = (entryId: string) => project.value.signs.filter((sign) => sign.terms.some((term) => term.termId === entryId));
+  const issueMap = () => issueMapBySign(project.value.termReport);
+  const bindingIssue = (bindingId: string, kind: "mismatch" | "missing") => {
+    const report = project.value.termReport;
+    return (kind === "mismatch" ? report.mismatchIssues : report.missingIssues).find((issue) => issue.bindingId === bindingId);
+  };
+  const bindingIssueForEntry = (entryId: string, language: string) => {
+    const report = project.value.termReport;
+    return [...report.mismatchIssues, ...report.missingIssues].some(
+      (issue) => issue.termId === entryId && issue.language === language,
+    );
+  };
+  const issueTotal = () => project.value.termReport.mismatchIssues.length + project.value.termReport.missingIssues.length;
 
   useVisibleTask$(({ track }) => {
     track(() => hydrated.value);
     if (!hydrated.value) {
       try {
-        const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: SignProject };
-        if (stored.schema === 1 && stored.project?.signs?.length) project.value = stored.project;
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (raw) {
+          const stored = JSON.parse(raw) as { schema?: number; project?: SignProject };
+          if (stored.project?.signs?.length) {
+            project.value = stored.schema === 2 ? stored.project : migrateProject(stored);
+          }
+        }
         const requestedPreview = new URLSearchParams(window.location.search).get("preview") ?? "";
         previewId.value = requestedPreview;
         readOnly.value = Boolean(requestedPreview);
@@ -202,7 +402,7 @@ export default component$(() => {
     if (!hydrated.value) return;
     track(() => project.value);
     const timer = window.setTimeout(() => {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 1, project: project.value }));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 2, project: project.value }));
     }, 450);
     cleanup(() => window.clearTimeout(timer));
   });
@@ -247,7 +447,9 @@ export default component$(() => {
 
   if (readOnly.value) {
     const sign = active();
-    const analysis = analyzeSign(sign, previewWidth.value, previewFont.value);
+    const analysis = analyzeSign(sign, previewWidth.value, previewFont.value, project.value.termEntries);
+    const report = project.value.termReport;
+    const signIssues = [...report.mismatchIssues, ...report.missingIssues].filter((issue) => issue.signId === sign.id);
     return (
       <main data-theme="corporate" class="min-h-screen bg-slate-100 p-6">
         <div class="mx-auto max-w-5xl">
@@ -265,12 +467,28 @@ export default component$(() => {
               <p class="whitespace-pre-line font-black leading-tight tracking-wide text-slate-900" style={{ fontSize: `${previewFont.value}px` }}>{analysis.visible.join("\n")}</p>
             </div>
             <div class="mt-5 text-center text-sm text-slate-500">{sign.targetLanguage} · {sign.regulation}</div>
+            {signIssues.length > 0 && (
+              <div class="mx-auto mt-8 max-w-2xl rounded-2xl border border-warning/50 bg-warning/10 p-4 text-left">
+                <div class="text-sm font-bold text-slate-700">术语核对（{new Date(report.checkedAt).toLocaleString()}）</div>
+                <ul class="mt-2 space-y-1 text-xs text-slate-600">
+                  {signIssues.map((issue) => (
+                    <li key={`${issue.kind}-${issue.bindingId}`}>
+                      {issue.kind === "mismatch"
+                        ? `「${issue.source}」绑定译法 ${issue.actual || "（空）"} 与固定译法 ${issue.expected} 不一致`
+                        : `必选术语「${issue.source}」的固定译法 ${issue.expected} 未出现在译文中`}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </section>
           <p class="mt-4 text-center text-xs text-slate-400">此链接读取当前浏览器中的本地版本，仅用于演示只读预览。</p>
         </div>
       </main>
     );
   }
+
+  const termReport = project.value.termReport;
 
   return (
     <div data-theme="corporate" class="min-h-screen bg-slate-100 pb-9 text-slate-800">
@@ -294,6 +512,16 @@ export default component$(() => {
           <span class={`badge ${online.value ? "badge-success" : "badge-warning"} badge-outline`}>{online.value ? "在线" : "离线草稿"}</span>
           <button class="btn btn-ghost btn-sm" disabled={!past.value.length} onClick$={undo}>撤销</button>
           <button class="btn btn-ghost btn-sm" disabled={!future.value.length} onClick$={redo}>重做</button>
+          <button
+            class={`btn btn-sm ${issueTotal() ? "btn-error" : "border-white/20 bg-white/10 text-white hover:bg-white/20"}`}
+            onClick$={() => {
+              const report = project.value.termReport;
+              glossaryTab.value = report.mismatchIssues.length + report.missingIssues.length ? "report" : "entries";
+              glossaryOpen.value = true;
+            }}
+          >
+            术语库{issueTotal() ? ` · ${issueTotal()} 项待处理` : ""}
+          </button>
           <button class="btn btn-sm border-white/20 bg-white/10 text-white hover:bg-white/20" onClick$={sharePreview}>复制只读链接</button>
           <button class={`btn btn-sm ${active().emergencyRevision ? "btn-error" : "btn-warning"}`} onClick$={toggleEmergency}>
             {active().emergencyRevision ? "退出紧急修订" : "紧急修订"}
@@ -317,7 +545,9 @@ export default component$(() => {
           </div>
           <div class="space-y-2">
             {project.value.signs.map((sign, index) => {
-              const risk = analyzeSign(sign, previewWidth.value, previewFont.value);
+              const risk = analyzeSign(sign, previewWidth.value, previewFont.value, project.value.termEntries);
+              const termIssues = issueMap().get(sign.id);
+              const termIssueCount = (termIssues?.mismatch.length ?? 0) + (termIssues?.missing.length ?? 0);
               return (
                 <button
                   key={sign.id}
@@ -334,8 +564,11 @@ export default component$(() => {
                   <div class="mt-2 line-clamp-2 text-sm font-semibold text-slate-700">{sign.sourceText}</div>
                   <div class="mt-2 flex items-center justify-between text-[11px] text-slate-500">
                     <span>{sign.targetLanguage}</span>
-                    <span class={risk.risk === "high" ? "font-bold text-error" : risk.risk === "medium" ? "font-bold text-warning" : "text-success"}>
-                      {risk.risk === "high" ? "高风险" : risk.risk === "medium" ? "需留意" : "版面正常"}
+                    <span class="flex items-center gap-1">
+                      {termIssueCount > 0 && <span class="badge badge-xs badge-error">术语 {termIssueCount}</span>}
+                      <span class={risk.risk === "high" ? "font-bold text-error" : risk.risk === "medium" ? "font-bold text-warning" : "text-success"}>
+                        {risk.risk === "high" ? "高风险" : risk.risk === "medium" ? "需留意" : "版面正常"}
+                      </span>
                     </span>
                   </div>
                   <span class="sr-only">第 {index + 1} 条</span>
@@ -381,7 +614,7 @@ export default component$(() => {
                   <label class="form-control">
                     <span class="label-text mb-1 text-xs font-bold text-slate-500">目标语言</span>
                     <select class="select select-bordered" value={active().targetLanguage} onChange$={(_, element) => updateActive("修改目标语言", (sign) => { sign.targetLanguage = element.value; sign.status = "pending"; })}>
-                      {["English", "日本語", "Français", "Deutsch", "한국어", "Español"].map((language) => <option key={language}>{language}</option>)}
+                      {TARGET_LANGUAGES.map((language) => <option key={language}>{language}</option>)}
                     </select>
                   </label>
                   <label class="form-control">
@@ -405,18 +638,21 @@ export default component$(() => {
                 />
                 <div class="flex flex-wrap gap-2">
                   {active().terms.map((term) => {
-                    const matched = active().targetText.toLocaleLowerCase().includes(term.target.toLocaleLowerCase());
+                    const entry = entryFor(term.termId);
+                    const expected = effectiveTermTarget(entry, active().targetLanguage, term.target);
+                    const matched = expected ? active().targetText.toLocaleLowerCase().includes(expected.toLocaleLowerCase()) : false;
+                    const stale = isBindingStale(term, entry, active().targetLanguage);
                     return (
                       <button
                         key={term.id}
-                        title="点击切换术语确认状态"
-                        class={`badge badge-lg gap-1 ${matched && term.confirmed ? "badge-success" : matched ? "badge-warning" : "badge-error"}`}
+                        title={stale ? "绑定译法与术语库固定译法不一致，点击切换确认状态" : "点击切换术语确认状态"}
+                        class={`badge badge-lg gap-1 ${stale ? "badge-error badge-outline" : matched && term.confirmed ? "badge-success" : matched ? "badge-warning" : "badge-error"}`}
                         onClick$={() => updateActive("确认术语", (sign) => {
                           const current = sign.terms.find((item) => item.id === term.id);
                           if (current) current.confirmed = !current.confirmed;
                         })}
                       >
-                        {term.source} → {term.target} {matched ? (term.confirmed ? "✓" : "!") : "×"}
+                        {term.source} → {expected || term.target} {stale ? "≠库" : matched ? (term.confirmed ? "✓" : "!") : "×"}
                       </button>
                     );
                   })}
@@ -427,27 +663,69 @@ export default component$(() => {
             <section class="card border border-slate-200 bg-white shadow-sm">
               <div class="card-body p-5">
                 <div class="flex items-center justify-between">
-                  <div><h2 class="font-bold">术语绑定</h2><p class="text-xs text-slate-500">必选术语未出现在译文中时会实时告警。</p></div>
-                  <span class="badge badge-outline">{active().terms.length} 条</span>
+                  <div><h2 class="font-bold">术语绑定</h2><p class="text-xs text-slate-500">从项目术语库挑选绑定；固定译法以术语库为准，调整固定译法会使引用标识退回待确认。</p></div>
+                  <div class="flex items-center gap-2">
+                    <span class="badge badge-outline">{active().terms.length} 条</span>
+                    <button class="btn btn-xs btn-outline" onClick$={() => { glossaryTab.value = "entries"; glossaryOpen.value = true; }}>管理术语库</button>
+                  </div>
                 </div>
-                <div class="mt-4 grid grid-cols-[1fr_1fr_auto] gap-2">
-                  <input class="input input-sm input-bordered" placeholder="中文术语" value={termSource.value} onInput$={(_, element) => termSource.value = element.value} />
-                  <input class="input input-sm input-bordered" placeholder="目标语言固定译法" value={termTarget.value} onInput$={(_, element) => termTarget.value = element.value} />
-                  <button class="btn btn-sm btn-primary" onClick$={addTerm}>绑定</button>
+                <div class="mt-4 grid grid-cols-[1fr_auto] gap-2">
+                  <select class="select select-sm select-bordered" value={bindTermId.value} onChange$={(_, element) => bindTermId.value = element.value}>
+                    <option value="" disabled>从术语库选择要绑定的术语…</option>
+                    {availableEntries().map((entry) => (
+                      <option key={entry.id} value={entry.id}>
+                        {entry.targets[active().targetLanguage]
+                          ? `${entry.source} → ${entry.targets[active().targetLanguage]}`
+                          : `${entry.source}（未登记该语言译法）`}
+                      </option>
+                    ))}
+                  </select>
+                  <button class="btn btn-sm btn-primary" disabled={!bindTermId.value} onClick$={bindLibraryTerm}>绑定所选</button>
+                </div>
+                {availableEntries().length === 0 && <p class="mt-1 text-[11px] text-slate-400">术语库中的条目都已绑定到当前标识。</p>}
+                <div class="mt-2 grid grid-cols-[1fr_1fr_auto] gap-2">
+                  <input class="input input-sm input-bordered" placeholder="新术语中文词" value={termSource.value} onInput$={(_, element) => termSource.value = element.value} />
+                  <input class="input input-sm input-bordered" placeholder={`${active().targetLanguage} 固定译法`} value={termTarget.value} onInput$={(_, element) => termTarget.value = element.value} />
+                  <button class="btn btn-sm btn-outline btn-primary" onClick$={addTerm}>登记并绑定</button>
                 </div>
                 <div class="mt-3 grid gap-2 md:grid-cols-2">
-                  {active().terms.map((term) => (
-                    <div key={term.id} class="flex items-center justify-between rounded-lg border border-slate-200 px-3 py-2">
-                      <div class="min-w-0">
-                        <div class="truncate text-xs font-bold">{term.source}</div>
-                        <div class="truncate text-xs text-slate-500">{term.target}</div>
+                  {active().terms.map((term) => {
+                    const signId = project.value.activeSignId;
+                    const entry = entryFor(term.termId);
+                    const fixed = entry?.targets[active().targetLanguage]?.trim() ?? "";
+                    const stale = isBindingStale(term, entry, active().targetLanguage);
+                    const missing = Boolean(bindingIssue(term.id, "missing"));
+                    return (
+                      <div key={term.id} class={`rounded-lg border px-3 py-2 ${stale ? "border-error/60 bg-error/5" : "border-slate-200"}`}>
+                        <div class="flex items-center justify-between gap-2">
+                          <div class="min-w-0">
+                            <div class="truncate text-xs font-bold">
+                              {term.source}
+                              <span class={`ml-1 badge badge-xs ${term.required ? "badge-warning" : "badge-ghost"}`}>{term.required ? "必选" : "可选"}</span>
+                            </div>
+                            <div class="mt-0.5 truncate text-[11px] text-slate-500">
+                              固定译法：{fixed || <span class="text-warning">未登记 {active().targetLanguage} 译法</span>}
+                            </div>
+                            <div class={`truncate text-[11px] ${stale ? "font-bold text-error" : "text-slate-500"}`}>
+                              标识绑定：{term.target || "（空）"}{stale ? "（与固定译法不一致）" : ""}
+                            </div>
+                            {missing && <div class="text-[11px] font-bold text-error">固定译法未出现在译文中</div>}
+                          </div>
+                          <div class="flex shrink-0 flex-col items-end gap-1">
+                            <div class="flex gap-1">
+                              <button class={`btn btn-xs ${term.confirmed ? "btn-success" : "btn-ghost"}`} onClick$={() => updateActive("确认术语", (sign) => { const target = sign.terms.find((item) => item.id === term.id); if (target) target.confirmed = !target.confirmed; })}>确认</button>
+                              <button class="btn btn-xs btn-ghost text-error" onClick$={() => updateActive("删除术语", (sign) => { sign.terms = sign.terms.filter((item) => item.id !== term.id); })}>删除</button>
+                            </div>
+                            <div class="flex gap-1">
+                              <button class="btn btn-xs btn-ghost" onClick$={() => updateActive("切换术语必选", (sign) => { const target = sign.terms.find((item) => item.id === term.id); if (target) target.required = !target.required; })}>{term.required ? "设为可选" : "设为必选"}</button>
+                              {stale && <button class="btn btn-xs btn-outline btn-error" onClick$={() => syncBinding(signId, term.id)}>同步固定译法</button>}
+                            </div>
+                          </div>
+                        </div>
                       </div>
-                      <div class="flex gap-1">
-                        <button class={`btn btn-xs ${term.confirmed ? "btn-success" : "btn-ghost"}`} onClick$={() => updateActive("确认术语", (sign) => { const target = sign.terms.find((item) => item.id === term.id); if (target) target.confirmed = !target.confirmed; })}>确认</button>
-                        <button class="btn btn-xs btn-ghost text-error" onClick$={() => updateActive("删除术语", (sign) => { sign.terms = sign.terms.filter((item) => item.id !== term.id); })}>删除</button>
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
+                  {active().terms.length === 0 && <div class="rounded-lg border border-dashed p-4 text-center text-xs text-slate-400 md:col-span-2">尚未绑定术语，从上方术语库选择或登记新术语。</div>}
                 </div>
               </div>
             </section>
@@ -507,7 +785,7 @@ export default component$(() => {
                 <div class="mt-4 overflow-hidden rounded-xl bg-slate-800 p-3">
                   <div class="mx-auto grid min-h-48 place-items-center overflow-hidden border-4 border-white bg-[#174f3d] p-3 text-center text-white" style={{ width: `${previewWidth.value}px`, maxWidth: "100%" }}>
                     <div>
-                      <div style={{ fontSize: `${previewFont.value}px` }} class="font-black leading-[1.18] tracking-wide">{preview().visible.map((line, index) => <div key={index}>{line || "\u00a0"}</div>)}</div>
+                      <div style={{ fontSize: `${previewFont.value}px` }} class="font-black leading-[1.18] tracking-wide">{preview().visible.map((line, index) => <div key={index}>{line || " "}</div>)}</div>
                     </div>
                   </div>
                 </div>
@@ -551,6 +829,162 @@ export default component$(() => {
           </section>
         </aside>
       </div>
+
+      {glossaryOpen.value && (
+        <div class="fixed inset-0 z-50 grid place-items-center bg-slate-900/50 p-4" onClick$={(event) => { if (event.target === event.currentTarget) glossaryOpen.value = false; }}>
+          <div class="flex max-h-[88vh] w-full max-w-5xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl">
+            <div class="flex items-center justify-between border-b border-slate-200 px-5 py-3">
+              <div>
+                <h2 class="text-lg font-bold">项目术语库</h2>
+                <p class="text-xs text-slate-500">登记中文词与各目标语言的固定译法；标识绑定从这里挑选，核对结果随项目一起保存在本地。</p>
+              </div>
+              <button class="btn btn-sm btn-ghost" onClick$={() => glossaryOpen.value = false}>关闭</button>
+            </div>
+            <div class="flex items-center gap-2 border-b border-slate-200 px-5 py-2">
+              <button class={`btn btn-xs ${glossaryTab.value === "report" ? "btn-primary" : "btn-ghost"}`} onClick$={() => glossaryTab.value = "report"}>
+                核对结果{issueTotal() ? `（${issueTotal()}）` : ""}
+              </button>
+              <button class={`btn btn-xs ${glossaryTab.value === "entries" ? "btn-primary" : "btn-ghost"}`} onClick$={() => glossaryTab.value = "entries"}>
+                术语登记（{project.value.termEntries.length}）
+              </button>
+              <span class="ml-auto text-[11px] text-slate-400">核对时间 {new Date(termReport.checkedAt).toLocaleString()}</span>
+            </div>
+
+            <div class="min-h-0 flex-1 overflow-y-auto p-5">
+              {glossaryTab.value === "report" ? (
+                <div class="space-y-5">
+                  <div class="grid grid-cols-2 gap-3 text-center">
+                    <div class={`rounded-xl border p-3 ${termReport.mismatchIssues.length ? "border-error/40 bg-error/5" : "border-slate-200"}`}>
+                      <strong class={`block text-2xl ${termReport.mismatchIssues.length ? "text-error" : ""}`}>{termReport.mismatchIssues.length}</strong>
+                      <span class="text-xs">译法与固定译法不一致</span>
+                    </div>
+                    <div class={`rounded-xl border p-3 ${termReport.missingIssues.length ? "border-warning/50 bg-warning/10" : "border-slate-200"}`}>
+                      <strong class={`block text-2xl ${termReport.missingIssues.length ? "text-warning" : ""}`}>{termReport.missingIssues.length}</strong>
+                      <span class="text-xs">必选术语未出现在译文</span>
+                    </div>
+                  </div>
+
+                  <section>
+                    <h3 class="mb-2 text-sm font-bold">译法不一致的标识</h3>
+                    {termReport.mismatchIssues.length === 0 && <div class="rounded-xl border border-dashed p-4 text-center text-xs text-slate-400">所有绑定的译法都与术语库固定译法一致。</div>}
+                    <div class="space-y-2">
+                      {termReport.mismatchIssues.map((issue) => (
+                        <div key={`mismatch-${issue.bindingId}`} class="flex items-center justify-between gap-3 rounded-xl border border-error/40 bg-error/5 px-3 py-2">
+                          <div class="min-w-0">
+                            <div class="flex items-center gap-2">
+                              <button class="badge badge-sm badge-outline" onClick$={() => jumpToSign(issue.signId)}>{issue.signCode}</button>
+                              <span class="text-sm font-bold">{issue.source}</span>
+                              <span class="badge badge-xs">{issue.language}</span>
+                            </div>
+                            <div class="mt-1 text-xs text-slate-600">
+                              固定译法 <strong>{issue.expected}</strong>，标识绑定 <strong class="text-error">{issue.actual || "（空）"}</strong>
+                            </div>
+                          </div>
+                          <div class="flex shrink-0 gap-1">
+                            <button class="btn btn-xs btn-outline btn-error" onClick$={() => syncBinding(issue.signId, issue.bindingId)}>同步固定译法</button>
+                            <button class="btn btn-xs btn-ghost" onClick$={() => jumpToSign(issue.signId)}>查看标识</button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+
+                  <section>
+                    <h3 class="mb-2 text-sm font-bold">必选术语未出现在译文的标识</h3>
+                    {termReport.missingIssues.length === 0 && <div class="rounded-xl border border-dashed p-4 text-center text-xs text-slate-400">所有必选术语的固定译法都已出现在译文中。</div>}
+                    <div class="space-y-2">
+                      {termReport.missingIssues.map((issue) => (
+                        <div key={`missing-${issue.bindingId}`} class="flex items-center justify-between gap-3 rounded-xl border border-warning/50 bg-warning/10 px-3 py-2">
+                          <div class="min-w-0">
+                            <div class="flex items-center gap-2">
+                              <button class="badge badge-sm badge-outline" onClick$={() => jumpToSign(issue.signId)}>{issue.signCode}</button>
+                              <span class="text-sm font-bold">{issue.source}</span>
+                              <span class="badge badge-xs">{issue.language}</span>
+                            </div>
+                            <div class="mt-1 text-xs text-slate-600">固定译法 <strong>{issue.expected}</strong> 未出现在当前译文中</div>
+                          </div>
+                          <button class="btn btn-xs btn-ghost shrink-0" onClick$={() => jumpToSign(issue.signId)}>查看标识</button>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                </div>
+              ) : (
+                <div class="space-y-4">
+                  <details class="rounded-xl border border-slate-200 bg-slate-50 p-3" open={project.value.termEntries.length === 0}>
+                    <summary class="cursor-pointer text-sm font-bold">登记新术语</summary>
+                    <div class="mt-3 grid grid-cols-[1fr_150px_1fr_auto_auto] items-center gap-2">
+                      <input class="input input-sm input-bordered" placeholder="中文词，如：无障碍电梯" value={newTermSource.value} onInput$={(_, element) => newTermSource.value = element.value} />
+                      <select class="select select-sm select-bordered" value={newTermLang.value} onChange$={(_, element) => newTermLang.value = element.value}>
+                        {TARGET_LANGUAGES.map((language) => <option key={language}>{language}</option>)}
+                      </select>
+                      <input class="input input-sm input-bordered" placeholder="固定译法" value={newTermTarget.value} onInput$={(_, element) => newTermTarget.value = element.value} />
+                      <label class="flex cursor-pointer items-center gap-1 text-xs">
+                        <input type="checkbox" class="checkbox checkbox-xs" checked={newTermRequired.value} onChange$={(_, element) => newTermRequired.value = element.checked} />
+                        必选
+                      </label>
+                      <button class="btn btn-sm btn-primary" onClick$={addGlossaryEntry}>登记</button>
+                    </div>
+                  </details>
+
+                  {project.value.termEntries.length === 0 && <div class="rounded-xl border border-dashed p-6 text-center text-sm text-slate-400">术语库还是空的，先登记一条术语。</div>}
+                  {project.value.termEntries.map((entry) => {
+                    const usages = entryUsages(entry.id);
+                    return (
+                      <article key={entry.id} class="rounded-xl border border-slate-200 p-4">
+                        <div class="flex items-center justify-between gap-3">
+                          <input
+                            class="input input-sm input-bordered w-56 font-bold"
+                            value={entry.source}
+                            aria-label="术语中文词"
+                            onChange$={(_, element) => renameEntry(entry.id, element.value)}
+                          />
+                          <div class="flex items-center gap-3 text-xs">
+                            <label class="flex cursor-pointer items-center gap-1">
+                              <input type="checkbox" class="checkbox checkbox-xs" checked={entry.required} onChange$={() => toggleEntryRequired(entry.id)} />
+                              默认必选
+                            </label>
+                            <span class="text-slate-400">{usages.length} 处标识引用</span>
+                            <button class="btn btn-xs btn-ghost text-error" onClick$={() => deleteEntry(entry.id)}>删除</button>
+                          </div>
+                        </div>
+                        <div class="mt-3 grid grid-cols-2 gap-2 md:grid-cols-3">
+                          {TARGET_LANGUAGES.map((language) => (
+                            <label key={language} class="form-control">
+                              <span class="label-text mb-0.5 text-[11px] text-slate-400">{language}</span>
+                              <input
+                                class={`input input-sm input-bordered ${bindingIssueForEntry(entry.id, language) ? "border-error" : ""}`}
+                                placeholder="未登记"
+                                value={entry.targets[language] ?? ""}
+                                onChange$={(_, element) => updateFixedTarget(entry.id, language, element.value)}
+                              />
+                            </label>
+                          ))}
+                        </div>
+                        {usages.length > 0 && (
+                          <div class="mt-3 flex flex-wrap items-center gap-1 text-[11px] text-slate-500">
+                            <span>引用标识：</span>
+                            {usages.map((sign) => {
+                              const issues = issueMap().get(sign.id);
+                              const count = (issues?.mismatch ?? []).filter((issue) => issue.termId === entry.id).length
+                                + (issues?.missing ?? []).filter((issue) => issue.termId === entry.id).length;
+                              return (
+                                <button key={sign.id} class={`badge badge-sm ${count ? "badge-error" : "badge-ghost"}`} onClick$={() => jumpToSign(sign.id)}>
+                                  {sign.code}{count ? ` · ${count}` : ""}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {toast.value && <div class="toast toast-end z-50"><div class="alert alert-success"><span>{toast.value}</span></div></div>}
     </div>

@@ -1,4 +1,9 @@
-import type { DiffToken, SignItem, TermBinding } from "./types";
+import type { DiffToken, SignItem, TermBinding, TermEntry } from "./types";
+
+export const uid = (prefix: string) =>
+  `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+
+const normalizeForCompare = (value: string) => value.trim().toLocaleLowerCase().replace(/\s+/g, " ");
 
 export function estimatedLines(text: string, width: number, fontSize: number, lineHeight = 1.25) {
   if (!text.trim()) return [];
@@ -31,7 +36,7 @@ export function estimatedLines(text: string, width: number, fontSize: number, li
   return lines;
 }
 
-export function analyzeSign(sign: SignItem, width: number, fontSize: number) {
+export function analyzeSign(sign: SignItem, width: number, fontSize: number, termEntries: TermEntry[] = []) {
   const lines = estimatedLines(sign.targetText, width, fontSize);
   const lineCapacity = Math.max(1, Math.floor((width * 0.62) / (fontSize * 1.25)));
   const visible = lines.slice(0, lineCapacity);
@@ -39,9 +44,13 @@ export function analyzeSign(sign: SignItem, width: number, fontSize: number) {
   const longest = lines.reduce((max, line) => Math.max(max, line.length), 0);
   const estimatedCharacterLimit = Math.max(12, Math.floor((width - 48) / (fontSize * 0.55)) * lineCapacity);
   const tooLong = sign.targetText.replace(/\s/g, "").length > estimatedCharacterLimit;
-  const missingTerms = sign.terms.filter(
-    (term) => term.required && !sign.targetText.toLocaleLowerCase().includes(term.target.toLocaleLowerCase()),
-  );
+  const target = normalizeForCompare(sign.targetText);
+  const missingTerms = sign.terms.filter((term) => {
+    if (!term.required) return false;
+    const entry = termEntries.find((item) => item.id === term.termId);
+    const expected = entry?.targets[sign.targetLanguage]?.trim() || term.target;
+    return !expected || !target.includes(normalizeForCompare(expected));
+  });
   return {
     lines,
     visible,
