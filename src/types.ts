@@ -18,10 +18,19 @@ export interface ReviewComment {
 
 export interface TermBinding {
   id: string;
+  glossaryId?: string;
   source: string;
   target: string;
   required: boolean;
   confirmed: boolean;
+}
+
+export interface GlossaryEntry {
+  id: string;
+  source: string;
+  translations: Record<string, string>;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface VersionSnapshot {
@@ -56,6 +65,7 @@ export interface SignProject {
   location: string;
   activeSignId: string;
   signs: SignItem[];
+  glossary: GlossaryEntry[];
   updatedAt: string;
 }
 

@@ -1,4 +1,4 @@
-import type { ReviewStatus, SignItem, SignProject, TermBinding } from "./types";
+import type { GlossaryEntry, ReviewStatus, SignItem, SignProject, TermBinding } from "./types";
 
 export const uid = (prefix: string) =>
   `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -10,13 +10,37 @@ export const STATUS_LABELS: Record<ReviewStatus, string> = {
   changes: "需修改",
 };
 
-const term = (source: string, target: string, confirmed = false, required = true): TermBinding => ({
+export const LANGUAGES = ["English", "日本語", "Français", "Deutsch", "한국어", "Español"];
+
+const term = (glossaryId: string, source: string, target: string, confirmed = false, required = true): TermBinding => ({
   id: uid("term"),
+  glossaryId,
   source,
   target,
   required,
   confirmed,
 });
+
+export const createSeedGlossary = (): GlossaryEntry[] => {
+  const stamp = "2026-09-20T08:00:00.000Z";
+  const entry = (id: string, source: string, translations: Record<string, string>): GlossaryEntry => ({
+    id,
+    source,
+    translations,
+    createdAt: stamp,
+    updatedAt: stamp,
+  });
+  return [
+    entry("gloss-waiting-area", "候车区", { English: "Waiting Area" }),
+    entry("gloss-yellow-line", "黄线", { English: "yellow line" }),
+    entry("gloss-emergency-exit", "紧急出口", { English: "EMERGENCY EXIT" }),
+    entry("gloss-elevator", "电梯", { English: "elevator" }),
+    entry("gloss-drinking-water", "直饮水", { "日本語": "飲料水" }),
+    entry("gloss-sink", "水槽", { "日本語": "排水口" }),
+    entry("gloss-no-smoking", "禁止吸烟", { "Français": "INTERDICTION DE FUMER" }),
+    entry("gloss-e-cigarette", "电子烟", { "Français": "Cigarettes électroniques" }),
+  ];
+};
 
 export const createSeedProject = (): SignProject => {
   const signs: SignItem[] = [
@@ -29,7 +53,7 @@ export const createSeedProject = (): SignProject => {
       scenario: "轨道交通站台",
       regulation: "GB/T 10001.1-2023 公共信息图形符号",
       status: "pending",
-      terms: [term("候车区", "Waiting Area"), term("黄线", "yellow line")],
+      terms: [term("gloss-waiting-area", "候车区", "Waiting Area"), term("gloss-yellow-line", "黄线", "yellow line")],
       comments: [],
       versions: [],
       emergencyRevision: false,
@@ -44,7 +68,7 @@ export const createSeedProject = (): SignProject => {
       scenario: "商场疏散通道",
       regulation: "GB 13495.1-2015 消防安全标志",
       status: "confirmed",
-      terms: [term("紧急出口", "EMERGENCY EXIT", true), term("电梯", "elevator", true)],
+      terms: [term("gloss-emergency-exit", "紧急出口", "EMERGENCY EXIT", true), term("gloss-elevator", "电梯", "elevator", true)],
       comments: [],
       versions: [],
       emergencyRevision: false,
@@ -59,7 +83,7 @@ export const createSeedProject = (): SignProject => {
       scenario: "公园服务亭",
       regulation: "城市公共设施双语标识译写规范",
       status: "changes",
-      terms: [term("直饮水", "飲料水"), term("水槽", "排水口")],
+      terms: [term("gloss-drinking-water", "直饮水", "飲用水"), term("gloss-sink", "水槽", "排水口")],
       comments: [],
       versions: [],
       emergencyRevision: false,
@@ -74,7 +98,7 @@ export const createSeedProject = (): SignProject => {
       scenario: "医院入口",
       regulation: "公共场所卫生管理条例实施细则",
       status: "draft",
-      terms: [term("禁止吸烟", "INTERDICTION DE FUMER"), term("电子烟", "Cigarettes électroniques")],
+      terms: [term("gloss-no-smoking", "禁止吸烟", "INTERDICTION DE FUMER"), term("gloss-e-cigarette", "电子烟", "Cigarettes électroniques")],
       comments: [],
       versions: [],
       emergencyRevision: false,
@@ -88,6 +112,7 @@ export const createSeedProject = (): SignProject => {
     location: "滨海交通枢纽一期",
     activeSignId: signs[0].id,
     signs,
+    glossary: createSeedGlossary(),
     updatedAt: new Date().toISOString(),
   };
 };
